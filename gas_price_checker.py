@@ -7,8 +7,21 @@ import signal
 from telegram import Bot
 from telegram.error import TelegramError
 
-# Configure logging to output to the Docker console
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Map the logging level string from the environment variable to a logging constant
+def get_logging_level():
+    log_level = os.getenv('LOGGING_LEVEL', 'INFO').upper()  # Default to INFO if not set
+    log_levels = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+        'CRITICAL': logging.CRITICAL
+    }
+    return log_levels.get(log_level, logging.INFO)  # Default to INFO if invalid value
+
+# Configure logging with a level from the environment variable
+logging.basicConfig(level=get_logging_level(), format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # Read environment variables for Telegram bot and chat details
 telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN', 'default_token')
@@ -25,10 +38,15 @@ api_url = f'https://api.etherscan.io/api?module=gastracker&action=gasoracle&apik
 
 # Threshold
 try:
-    gas_fee_threshold = float(os.getenv('GAS_FEE_THRESHOLD', '100'))
+    gas_fee_lower_threshold = float(os.getenv('GAS_FEE_LOWER_THRESHOLD', '30'))
 except ValueError:
-    logging.warning(f"Invalid GAS_FEE_THRESHOLD value")
-    gas_fee_threshold = 100.0
+    logging.warning(f"Invalid gas_fee_lower_threshold value")
+    gas_fee_lower_threshold = 30.0
+try:
+    gas_fee_upper_threshold = float(os.getenv('GAS_FEE_UPPER_THRESHOLD', '50'))
+except ValueError:
+    logging.warning(f"Invalid gas_fee_upper_threshold value")
+    gas_fee_upper_threshold = 50.0
 
 # Interval in seconds to check for update
 try:
@@ -61,7 +79,7 @@ def read_state():
     # If the file exists, read the state from the file
     with open(state_file_path, 'r') as file:
         state = file.read().strip() == 'True'
-        logging.info(f"State file content: {state}")
+        logging.debug(f"State file content: {state}")
         return state
 
 # Function to write the current state to a file
@@ -71,7 +89,7 @@ def write_state(state):
 
 # Function to check the gas price and send a notification if needed
 async def check_gas_price_and_notify():
-    logging.info(f"Checking if gas fee is below {gas_fee_threshold}...")
+    logging.debug(f"Checking if gas fee is below {gas_fee_lower_threshold}...")
     
     # Read the current state (True means notification has been sent, False means it hasn't)
     notified_state = read_state()
@@ -87,24 +105,29 @@ async def check_gas_price_and_notify():
         # More detailed error handling for API response
         if data.get('status') == '1' and 'result' in data and 'ProposeGasPrice' in data['result']:
             propose_gas_price = float(data['result']['ProposeGasPrice'])
+            logging.debug(f'ProposeGasPrice: {propose_gas_price}')
             
             # Check if the ProposeGasPrice falls below notified_state and hasn't already triggered an alert
-            if propose_gas_price < gas_fee_threshold and not notified_state:
+            if propose_gas_price < gas_fee_lower_threshold and not notified_state:
                 message = f'ETH Gas Fee: {propose_gas_price} - https://etherscan.io/gastracker'
                 await send_telegram_message(message)
                 write_state(True)  # Mark that the alert has been sent by writing to the file
             # Check if the ProposeGasPrice rises above notified_state, reset the alert state
-            elif propose_gas_price >= gas_fee_threshold and notified_state:
+            elif propose_gas_price > gas_fee_upper_threshold and notified_state:
                 write_state(False)  # Reset the state for future alerts
-                logging.info(f'ProposeGasPrice is {propose_gas_price}, resetting alert state.')
+                message = f'ETH Gas Fee wieder out of range ({propose_gas_price})'
+                await send_telegram_message(message)
+                logging.debug(f'ProposeGasPrice is above upper threshold, resetting alert state.')
             else:
-                logging.info(f'ProposeGasPrice is {propose_gas_price}, no action taken.')
+                logging.debug(f'No action taken')
         else:
             # Send a Telegram message if the API response is not OK or incomplete
             await send_telegram_message(f'API request returned invalid data or status: {data}')
+            logging.error(f'API request returned invalid data or status: {data}')
     except requests.RequestException as e:
         # Send a Telegram message if there's an exception (e.g., network failure)
         await send_telegram_message(f'API request failed with exception: {str(e)}')
+        logging.error(f'API request failed with exception: {str(e)}')
 
 # Exponential backoff retry mechanism
 async def retry_with_backoff(task, retries=2, delay=5):
@@ -122,6 +145,12 @@ async def retry_with_backoff(task, retries=2, delay=5):
 # Main loop to check the gas price
 async def main_loop():
     global shutdown_flag
+
+    logging.info(f'Started')
+    logging.info(f'ENV: gas_fee_lower_threshold: {gas_fee_lower_threshold}')
+    logging.info(f'ENV: gas_fee_upper_threshold: {gas_fee_upper_threshold}')
+    logging.info(f'ENV:check_interval: {check_interval}')
+
     while not shutdown_flag:
         await retry_with_backoff(check_gas_price_and_notify)
         await asyncio.sleep(check_interval)  # Wait before checking again
