@@ -58,16 +58,28 @@ except ValueError:
 # Track whether the program should stop (for graceful shutdown)
 shutdown_flag = False
 
-# Function to send a Telegram message
+# Send a Telegram message
 async def send_telegram_message(message):
     bot = Bot(token=telegram_bot_token)
     try:
-        await bot.send_message(chat_id=chat_id, text=message)
-        logging.info(f'Telegram notification sent: {message}')
+        msg = await bot.send_message(chat_id=chat_id, text=message)
+        logging.info(f'Telegram notification sent: {message} (ID: {msg.message_id})')
+        return msg.message_id  # Return the message ID
     except TelegramError as e:
         logging.error(f'Failed to send Telegram message: {str(e)}')
+        return None
 
-# Function to read the current state from a file, create it with False if it doesn't exist
+# Delete the a Telegram message
+async def delete_telegram_message(message_id):
+    bot = Bot(token=telegram_bot_token)
+    if message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logging.info(f"Deleted message ID: {message_id}")
+        except TelegramError as e:
+            logging.error(f'Failed to delete Telegram message: {str(e)}')
+
+# Read the current state from a file, create it with False if it doesn't exist
 def read_state():
     if not os.path.exists(state_file_path):
         # If the state file doesn't exist, create it with the initial value of False
@@ -82,17 +94,19 @@ def read_state():
         logging.debug(f"State file content: {state}")
         return state
 
-# Function to write the current state to a file
+# Write the current state to a file
 def write_state(state):
     with open(state_file_path, 'w') as file:
         file.write(str(state))
 
-# Function to check the gas price and send a notification if needed
+# Check the gas price and send a notification if needed
 async def check_gas_price_and_notify():
     logging.debug(f"Checking if gas fee is below {gas_fee_lower_threshold}...")
     
     # Read the current state (True means notification has been sent, False means it hasn't)
     notified_state = read_state()
+
+    global last_message_id_in_range
 
     try:
         # Make the API request
@@ -110,23 +124,21 @@ async def check_gas_price_and_notify():
             # Check if the ProposeGasPrice falls below notified_state and hasn't already triggered an alert
             if propose_gas_price < gas_fee_lower_threshold and not notified_state:
                 message = f'ETH Gas Fee: {propose_gas_price} - https://etherscan.io/gastracker'
-                await send_telegram_message(message)
+                last_message_id_in_range = await send_telegram_message(message)
                 write_state(True)  # Mark that the alert has been sent by writing to the file
             # Check if the ProposeGasPrice rises above notified_state, reset the alert state
             elif propose_gas_price > gas_fee_upper_threshold and notified_state:
-                write_state(False)  # Reset the state for future alerts
                 message = f'ETH Gas Fee wieder out of range ({propose_gas_price})'
                 await send_telegram_message(message)
+                await delete_telegram_message(last_message_id_in_range)
+                last_message_id_in_range = None
+                write_state(False)  # Reset the state for future alerts
                 logging.debug(f'ProposeGasPrice is above upper threshold, resetting alert state.')
             else:
                 logging.debug(f'No action taken')
         else:
-            # Send a Telegram message if the API response is not OK or incomplete
-            await send_telegram_message(f'API request returned invalid data or status: {data}')
-            logging.error(f'API request returned invalid data or status: {data}')
+                logging.error(f'API request returned invalid data or status: {data}')
     except requests.RequestException as e:
-        # Send a Telegram message if there's an exception (e.g., network failure)
-        await send_telegram_message(f'API request failed with exception: {str(e)}')
         logging.error(f'API request failed with exception: {str(e)}')
 
 # Exponential backoff retry mechanism
