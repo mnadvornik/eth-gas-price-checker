@@ -128,8 +128,6 @@ async def check_gas_price_and_notify():
                 write_state(True)  # Mark that the alert has been sent by writing to the file
             # Check if the ProposeGasPrice rises above notified_state, reset the alert state
             elif propose_gas_price > gas_fee_upper_threshold and notified_state:
-                message = f'ETH Gas Fee wieder out of range ({propose_gas_price})'
-                await send_telegram_message(message)
                 await delete_telegram_message(last_message_id_in_range)
                 last_message_id_in_range = None
                 write_state(False)  # Reset the state for future alerts
