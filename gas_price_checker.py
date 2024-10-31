@@ -27,9 +27,6 @@ logging.basicConfig(level=get_logging_level(), format='%(asctime)s - %(levelname
 telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN', 'default_token')
 chat_id = os.getenv('TELEGRAM_CHAT_ID', 'default_chat_id')
 
-# Read the state file path from environment variables (default to /data/notified_state.txt)
-state_file_path = os.getenv('STATE_FILE_PATH', '/data/notified_state.txt')
-
 # Read the Etherscan API key from environment variables
 etherscan_api_key = os.getenv('ETHERSCAN_API_KEY', 'default_api_key')
 
@@ -58,6 +55,10 @@ except ValueError:
 # Track whether the program should stop (for graceful shutdown)
 shutdown_flag = False
 
+# Tracking Variables
+last_message_id_in_range = None
+last_price = -1
+
 # Send a Telegram message
 async def send_telegram_message(message):
     bot = Bot(token=telegram_bot_token)
@@ -69,6 +70,15 @@ async def send_telegram_message(message):
         logging.error(f'Failed to send Telegram message: {str(e)}')
         return None
 
+# Edit an existing Telegram message
+async def edit_telegram_message(message_id, new_message):
+    bot = Bot(token=telegram_bot_token)
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_message)
+        logging.info(f"Edited message ID: {message_id} with new content: {new_message}")
+    except TelegramError as e:
+        logging.error(f'Failed to edit Telegram message: {str(e)}')
+
 # Delete the a Telegram message
 async def delete_telegram_message(message_id):
     bot = Bot(token=telegram_bot_token)
@@ -79,34 +89,12 @@ async def delete_telegram_message(message_id):
         except TelegramError as e:
             logging.error(f'Failed to delete Telegram message: {str(e)}')
 
-# Read the current state from a file, create it with False if it doesn't exist
-def read_state():
-    if not os.path.exists(state_file_path):
-        # If the state file doesn't exist, create it with the initial value of False
-        with open(state_file_path, 'w') as file:
-            file.write('False')
-        logging.info(f"State file not found. Created {state_file_path} with default value 'False'.")
-        return False
-    
-    # If the file exists, read the state from the file
-    with open(state_file_path, 'r') as file:
-        state = file.read().strip() == 'True'
-        logging.debug(f"State file content: {state}")
-        return state
-
-# Write the current state to a file
-def write_state(state):
-    with open(state_file_path, 'w') as file:
-        file.write(str(state))
-
 # Check the gas price and send a notification if needed
 async def check_gas_price_and_notify():
     logging.debug(f"Checking if gas fee is below {gas_fee_lower_threshold}...")
-    
-    # Read the current state (True means notification has been sent, False means it hasn't)
-    notified_state = read_state()
 
     global last_message_id_in_range
+    global last_price
 
     try:
         # Make the API request
@@ -119,23 +107,25 @@ async def check_gas_price_and_notify():
         # More detailed error handling for API response
         if data.get('status') == '1' and 'result' in data and 'ProposeGasPrice' in data['result']:
             propose_gas_price = float(data['result']['ProposeGasPrice'])
-            logging.debug(f'ProposeGasPrice: {propose_gas_price}')
+            logging.info(f'ProposeGasPrice: {propose_gas_price}, last_price: {last_price}, last_message_id_in_range: {last_message_id_in_range}')
             
-            # Check if the ProposeGasPrice falls below notified_state and hasn't already triggered an alert
-            if propose_gas_price < gas_fee_lower_threshold and not notified_state:
+            # Check if the ProposeGasPrice falls below gas_fee_lower_threshold and hasn't already triggered an alert
+            if propose_gas_price < gas_fee_lower_threshold:
                 message = f'ETH Gas Fee: {propose_gas_price} - https://etherscan.io/gastracker'
-                last_message_id_in_range = await send_telegram_message(message)
-                write_state(True)  # Mark that the alert has been sent by writing to the file
-            # Check if the ProposeGasPrice rises above notified_state, reset the alert state
-            elif propose_gas_price > gas_fee_upper_threshold and notified_state:
+                if last_message_id_in_range is None:
+                    last_message_id_in_range = await send_telegram_message(message)
+                elif last_message_id_in_range is not None and last_price != propose_gas_price:
+                    await edit_telegram_message(last_message_id_in_range, message)
+            # Check if the ProposeGasPrice rises above gas_fee_upper_threshold and delete message
+            elif propose_gas_price > gas_fee_upper_threshold and last_message_id_in_range is not None:
                 await delete_telegram_message(last_message_id_in_range)
                 last_message_id_in_range = None
-                write_state(False)  # Reset the state for future alerts
-                logging.debug(f'ProposeGasPrice is above upper threshold, resetting alert state.')
+                logging.debug(f'ProposeGasPrice is above upper threshold, deleted message')
             else:
                 logging.debug(f'No action taken')
         else:
                 logging.error(f'API request returned invalid data or status: {data}')
+        last_price = propose_gas_price
     except requests.RequestException as e:
         logging.error(f'API request failed with exception: {str(e)}')
 
